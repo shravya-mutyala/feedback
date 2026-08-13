@@ -1,0 +1,204 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Client Feedback Form - Serverless Application
+
+Globals:
+  Function:
+    Timeout: 10
+    Runtime: nodejs20.x
+    MemorySize: 256
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref FeedbackTable
+        LINKS_TABLE_NAME: !Ref FeedbackLinksTable
+        SES_FROM_EMAIL: !Ref SenderEmail
+
+Parameters:
+  SenderEmail:
+    Type: String
+    Description: Verified SES email address to send from
+  FrontendDomainName:
+    Type: String
+    Description: Custom domain for the frontend (optional)
+    Default: ''
+
+Resources:
+  # ============ API Gateway ============
+  FeedbackApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type'"
+        AllowOrigin: "'*'"
+
+  # ============ Lambda Functions ============
+  CreateLinkFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/createLink.handler
+      CodeUri: ../backend/
+      Description: Generate a unique feedback link for a client
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FeedbackLinksTable
+      Events:
+        CreateLink:
+          Type: Api
+          Properties:
+            RestApiId: !Ref FeedbackApi
+            Path: /links
+            Method: POST
+
+  GetLinkFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/getLink.handler
+      CodeUri: ../backend/
+      Description: Retrieve client info for a feedback link
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref FeedbackLinksTable
+      Events:
+        GetLink:
+          Type: Api
+          Properties:
+            RestApiId: !Ref FeedbackApi
+            Path: /links/{token}
+            Method: GET
+
+  SubmitFeedbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/submitFeedback.handler
+      CodeUri: ../backend/
+      Description: Process feedback submission and email manager
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FeedbackTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FeedbackLinksTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: '*'
+      Events:
+        SubmitFeedback:
+          Type: Api
+          Properties:
+            RestApiId: !Ref FeedbackApi
+            Path: /feedback
+            Method: POST
+
+  # ============ DynamoDB Tables ============
+  FeedbackLinksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: FeedbackLinks
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: token
+          AttributeType: S
+      KeySchema:
+        - AttributeName: token
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  FeedbackTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: FeedbackSubmissions
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+        - AttributeName: createdAt
+          KeyType: RANGE
+
+  # ============ S3 Bucket for Frontend ============
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-frontend'
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  # ============ CloudFront Distribution ============
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !Ref CloudFrontOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          Compress: true
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${FeedbackApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+  FrontendBucketName:
+    Description: S3 bucket for frontend deployment
+    Value: !Ref FrontendBucket
+  CloudFrontUrl:
+    Description: CloudFront distribution URL
+    Value: !GetAtt CloudFrontDistribution.DomainName
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID (for cache invalidation)
+    Value: !Ref CloudFrontDistribution
