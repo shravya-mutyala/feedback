@@ -23,6 +23,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Debug - show OIDC subject claim
+        run: |
+          echo "repository: $GITHUB_REPOSITORY"
+          echo "ref:        $GITHUB_REF"
+          echo "expected sub: repo:${GITHUB_REPOSITORY}:ref:${GITHUB_REF}"
+
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
