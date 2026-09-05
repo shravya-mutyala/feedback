@@ -56,7 +56,10 @@ jobs:
           sam deploy \
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
+            --resolve-s3 \
             --stack-name "$STACK_NAME" \
+            --capabilities CAPABILITY_IAM \
+            --parameter-overrides "SenderEmail=Shravya.Mutyala@scalecapacity.com" \
             --region "$AWS_REGION"
 
       # ---- Read stack outputs for the frontend build ----
