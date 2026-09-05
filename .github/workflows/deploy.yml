@@ -1,0 +1,108 @@
+name: Deploy Feedback App
+
+# Deploys backend (SAM) + frontend (S3/CloudFront) on every push to main.
+# You can also run it manually from the Actions tab via "Run workflow".
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Required for GitHub OIDC to request AWS credentials.
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: client-feedback-app
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up Python (for SAM CLI)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install AWS SAM CLI
+        run: pip install aws-sam-cli
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm install
+
+      # ---- Backend + infrastructure ----
+      - name: SAM build
+        working-directory: infrastructure
+        run: sam build
+
+      - name: SAM deploy
+        working-directory: infrastructure
+        run: |
+          sam deploy \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --stack-name "$STACK_NAME" \
+            --region "$AWS_REGION"
+
+      # ---- Read stack outputs for the frontend build ----
+      - name: Read stack outputs
+        id: outputs
+        run: |
+          API_URL=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].Outputs[?OutputKey==`ApiUrl`].OutputValue' \
+            --output text)
+          BUCKET_NAME=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].Outputs[?OutputKey==`FrontendBucketName`].OutputValue' \
+            --output text)
+          CF_DISTRIBUTION=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].Outputs[?OutputKey==`CloudFrontDistributionId`].OutputValue' \
+            --output text)
+          echo "api_url=$API_URL" >> "$GITHUB_OUTPUT"
+          echo "bucket_name=$BUCKET_NAME" >> "$GITHUB_OUTPUT"
+          echo "cf_distribution=$CF_DISTRIBUTION" >> "$GITHUB_OUTPUT"
+
+      # ---- Frontend build + deploy ----
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm install
+
+      - name: Build frontend
+        working-directory: frontend
+        env:
+          VITE_API_URL: ${{ steps.outputs.outputs.api_url }}
+        run: npm run build
+
+      - name: Sync frontend to S3
+        working-directory: frontend
+        run: aws s3 sync dist/ "s3://${{ steps.outputs.outputs.bucket_name }}/" --delete
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ steps.outputs.outputs.cf_distribution }}" \
+            --paths "/*"
+
+      - name: Deployment summary
+        run: |
+          echo "### Deployment complete :rocket:" >> "$GITHUB_STEP_SUMMARY"
+          echo "- API URL: ${{ steps.outputs.outputs.api_url }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Frontend bucket: ${{ steps.outputs.outputs.bucket_name }}" >> "$GITHUB_STEP_SUMMARY"
